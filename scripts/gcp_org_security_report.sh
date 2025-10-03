@@ -19,7 +19,7 @@ HTTP_TIMEOUT=60
 CURL_FLAGS=(--silent --show-error --fail --max-time "$HTTP_TIMEOUT")
 WORK_DIR=""
 VERBOSE=0
-LOG_TO_STDOUT=0
+LOG_FILE=""
 SKIP_CAI=0
 SKIP_RECOMMENDER=0
 PROJECTS_LIMIT=0
@@ -32,8 +32,8 @@ log() {
   local line
   line="[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"
   printf "%s\n" "$line" >&2
-  if [[ "${LOG_TO_STDOUT:-0}" -eq 1 ]]; then
-    printf "%s\n" "$line"
+  if [[ -n "${LOG_FILE}" ]]; then
+    printf "%s\n" "$line" >>"${LOG_FILE}" || true
   fi
 }
 fail() { log "ERROR: $*"; exit 1; }
@@ -98,7 +98,7 @@ Options:
   --au-locations CSV              Allowed AU locations list (default: australia-southeast1,australia-southeast2)
   --timeout SECONDS               HTTP timeout per request (default: 60)
   --verbose                       Enable verbose execution trace
-  --log-stdout                    Duplicate logs to stdout (in addition to stderr)
+  --log-file PATH                 Additionally write logs to this file
   --skip-cai                      Skip Cloud Asset Inventory section
   --skip-recommender              Skip Active Assist recommender section
   --projects-limit N              Only process first N projects for recommender
@@ -122,7 +122,7 @@ parse_args() {
       --au-locations) ALLOWED_AU_LOCATIONS="$2"; shift 2 ;;
       --timeout) HTTP_TIMEOUT="$2"; CURL_FLAGS=(--silent --show-error --fail --max-time "$HTTP_TIMEOUT"); shift 2 ;;
       --verbose) VERBOSE=1; shift 1 ;;
-      --log-stdout) LOG_TO_STDOUT=1; shift 1 ;;
+      --log-file) LOG_FILE="$2"; shift 2 ;;
       --skip-cai) SKIP_CAI=1; shift 1 ;;
       --skip-recommender) SKIP_RECOMMENDER=1; shift 1 ;;
       --projects-limit) PROJECTS_LIMIT="$2"; shift 2 ;;
@@ -272,7 +272,10 @@ fetch_projects() {
     local resp
     resp=$(api_post_json "$url" "$req") || {
       log "WARN: v3 projects:search failed; falling back to v1 projects.list"
-      fetch_projects_v1
+      # Return pure JSON only from fallback to avoid mixing logs into data
+      local v1_json
+      v1_json=$(fetch_projects_v1) || fail "Fetching projects (v1) failed"
+      printf '%s' "$v1_json"
       return 0
     }
 
