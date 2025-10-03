@@ -21,7 +21,7 @@ WORK_DIR=""
 VERBOSE=0
 LOG_FILE=""
 SKIP_CAI=0
-SKIP_RECOMMENDER=0
+SKIP_RECOMMENDER=1
 PROJECTS_LIMIT=0
 USER_PROJECT=""
 
@@ -100,7 +100,8 @@ Options:
   --verbose                       Enable verbose execution trace
   --log-file PATH                 Additionally write logs to this file
   --skip-cai                      Skip Cloud Asset Inventory section
-  --skip-recommender              Skip Active Assist recommender section
+  --skip-recommender              Skip Active Assist recommender section (default)
+  --enable-recommender            Enable Active Assist recommender section
   --projects-limit N              Only process first N projects for recommender
   --user-project PROJECT_ID       Quota/billing project for API calls (x-goog-user-project)
   -h, --help                      Show this help
@@ -125,6 +126,7 @@ parse_args() {
       --log-file) LOG_FILE="$2"; shift 2 ;;
       --skip-cai) SKIP_CAI=1; shift 1 ;;
       --skip-recommender) SKIP_RECOMMENDER=1; shift 1 ;;
+      --enable-recommender) SKIP_RECOMMENDER=0; shift 1 ;;
       --projects-limit) PROJECTS_LIMIT="$2"; shift 2 ;;
       --user-project) USER_PROJECT="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
