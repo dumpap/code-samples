@@ -18,11 +18,23 @@ ALLOWED_AU_LOCATIONS="australia-southeast1,australia-southeast2"
 HTTP_TIMEOUT=60
 CURL_FLAGS=(--silent --show-error --fail --max-time "$HTTP_TIMEOUT")
 WORK_DIR=""
+VERBOSE=0
+LOG_TO_STDOUT=0
+SKIP_CAI=0
+SKIP_RECOMMENDER=0
+PROJECTS_LIMIT=0
 
 ################################################################################
 # Utilities
 ################################################################################
-log() { printf "[%s] %s\n" "$(date +'%Y-%m-%dT%H:%M:%S%z')" "$*" >&2; }
+log() {
+  local line
+  line="[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"
+  printf "%s\n" "$line" >&2
+  if [[ "${LOG_TO_STDOUT:-0}" -eq 1 ]]; then
+    printf "%s\n" "$line"
+  fi
+}
 fail() { log "ERROR: $*"; exit 1; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -84,6 +96,11 @@ Options:
   --output-file PATH              Output HTML file path (default: ./gcp_org_security_report.html)
   --au-locations CSV              Allowed AU locations list (default: australia-southeast1,australia-southeast2)
   --timeout SECONDS               HTTP timeout per request (default: 60)
+  --verbose                       Enable verbose execution trace
+  --log-stdout                    Duplicate logs to stdout (in addition to stderr)
+  --skip-cai                      Skip Cloud Asset Inventory section
+  --skip-recommender              Skip Active Assist recommender section
+  --projects-limit N              Only process first N projects for recommender
   -h, --help                      Show this help
 
 Notes:
@@ -102,12 +119,20 @@ parse_args() {
       --output-file) OUTPUT_FILE="$2"; shift 2 ;;
       --au-locations) ALLOWED_AU_LOCATIONS="$2"; shift 2 ;;
       --timeout) HTTP_TIMEOUT="$2"; CURL_FLAGS=(--silent --show-error --fail --max-time "$HTTP_TIMEOUT"); shift 2 ;;
+      --verbose) VERBOSE=1; shift 1 ;;
+      --log-stdout) LOG_TO_STDOUT=1; shift 1 ;;
+      --skip-cai) SKIP_CAI=1; shift 1 ;;
+      --skip-recommender) SKIP_RECOMMENDER=1; shift 1 ;;
+      --projects-limit) PROJECTS_LIMIT="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) fail "Unknown argument: $1" ;;
     esac
   done
 
   [[ -z "$ORG_ID" ]] && fail "--org-id is required"
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    set -x
+  fi
 }
 
 ################################################################################
@@ -456,21 +481,42 @@ main() {
 
   log "Searching for resources outside AU via Cloud Asset Inventory"
   local assets_json
-  assets_json=$(fetch_cai_outside_au)
-  log "Found $(printf '%s' "$assets_json" | jq 'length') resources outside AU"
+  if [[ "$SKIP_CAI" -eq 1 ]]; then
+    log "Skipping CAI section due to --skip-cai"
+    assets_json='[]'
+  else
+    assets_json=$(fetch_cai_outside_au)
+    log "Found $(printf '%s' "$assets_json" | jq 'length') resources outside AU"
+  fi
 
   log "Fetching Active Assist SECURITY recommendations per project"
   local recs_all="[]"
   # Iterate projects and collect recommendations
-  local p_count=0
-  printf '%s' "$projects_json" | jq -r '.[].projectNumber' | while read -r pnum; do
-    [[ -z "$pnum" ]] && continue
-    p_count=$((p_count+1)) || true
-    log "Project ${pnum}: querying recommender list and recommendations"
-    local recs
-    recs=$(fetch_security_recommendations_for_project "$pnum") || recs='[]'
-    printf '%s\n' "$recs"
-  done > "$WORK_DIR/recs_stream.jsonl"
+  if [[ "$SKIP_RECOMMENDER" -eq 1 ]]; then
+    log "Skipping recommender section due to --skip-recommender"
+  else
+    local p_count=0
+    if [[ "${PROJECTS_LIMIT:-0}" -gt 0 ]]; then
+      log "Limiting recommender queries to first ${PROJECTS_LIMIT} projects"
+      printf '%s' "$projects_json" | jq -r --argjson n "$PROJECTS_LIMIT" '.[0:$n][] | .projectNumber' | while read -r pnum; do
+        [[ -z "$pnum" ]] && continue
+        p_count=$((p_count+1)) || true
+        log "Project ${pnum}: querying recommender list and recommendations"
+        local recs
+        recs=$(fetch_security_recommendations_for_project "$pnum") || recs='[]'
+        printf '%s\n' "$recs"
+      done > "$WORK_DIR/recs_stream.jsonl"
+    else
+      printf '%s' "$projects_json" | jq -r '.[] | .projectNumber' | while read -r pnum; do
+        [[ -z "$pnum" ]] && continue
+        p_count=$((p_count+1)) || true
+        log "Project ${pnum}: querying recommender list and recommendations"
+        local recs
+        recs=$(fetch_security_recommendations_for_project "$pnum") || recs='[]'
+        printf '%s\n' "$recs"
+      done > "$WORK_DIR/recs_stream.jsonl"
+    fi
+  fi
 
   if [[ -s "$WORK_DIR/recs_stream.jsonl" ]]; then
     recs_all=$(jq -s 'flatten' "$WORK_DIR/recs_stream.jsonl")
