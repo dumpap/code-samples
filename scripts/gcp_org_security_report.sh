@@ -23,6 +23,7 @@ LOG_TO_STDOUT=0
 SKIP_CAI=0
 SKIP_RECOMMENDER=0
 PROJECTS_LIMIT=0
+USER_PROJECT=""
 
 ################################################################################
 # Utilities
@@ -101,6 +102,7 @@ Options:
   --skip-cai                      Skip Cloud Asset Inventory section
   --skip-recommender              Skip Active Assist recommender section
   --projects-limit N              Only process first N projects for recommender
+  --user-project PROJECT_ID       Quota/billing project for API calls (x-goog-user-project)
   -h, --help                      Show this help
 
 Notes:
@@ -124,6 +126,7 @@ parse_args() {
       --skip-cai) SKIP_CAI=1; shift 1 ;;
       --skip-recommender) SKIP_RECOMMENDER=1; shift 1 ;;
       --projects-limit) PROJECTS_LIMIT="$2"; shift 2 ;;
+      --user-project) USER_PROJECT="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) fail "Unknown argument: $1" ;;
     esac
@@ -210,16 +213,44 @@ auth_header() { printf 'Authorization: Bearer %s' "$ACCESS_TOKEN"; }
 ################################################################################
 # API helpers
 ################################################################################
-api_get() {
-  local url="$1"
-  curl "${CURL_FLAGS[@]}" -H "$(auth_header)" -H 'Accept: application/json' "$url"
+api_request() {
+  # Usage: api_request METHOD URL [BODY]
+  local method="$1"; shift
+  local url="$1"; shift || true
+  local body="${1:-}"
+  local headers=(-H "$(auth_header)" -H 'Accept: application/json')
+  if [[ -n "$USER_PROJECT" ]]; then
+    headers+=( -H "x-goog-user-project: ${USER_PROJECT}" )
+  fi
+  if [[ "$method" == "POST" || "$method" == "PATCH" || "$method" == "PUT" ]]; then
+    headers+=( -H 'Content-Type: application/json' )
+  fi
+  # Capture body and HTTP status; do not use --fail so we can read error body
+  local resp http_code
+  if [[ -n "$body" ]]; then
+    resp=$(curl --silent --show-error --max-time "$HTTP_TIMEOUT" -X "$method" "${headers[@]}" -d "$body" "$url" -w $'\n%{http_code}')
+  else
+    resp=$(curl --silent --show-error --max-time "$HTTP_TIMEOUT" -X "$method" "${headers[@]}" "$url" -w $'\n%{http_code}')
+  fi
+  http_code="${resp##*$'\n'}"
+  resp="${resp%$'\n'$http_code}"
+  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    printf '%s' "$resp"
+    return 0
+  fi
+  # Try to extract message from JSON error
+  local msg
+  msg=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null || true)
+  if [[ -n "$msg" ]]; then
+    log "HTTP ${http_code} ${url} -> ${msg}"
+  else
+    log "HTTP ${http_code} ${url} -> ${resp}"
+  fi
+  return 22
 }
 
-api_post_json() {
-  local url="$1"; shift
-  local body="$1"; shift || true
-  curl "${CURL_FLAGS[@]}" -X POST -H "$(auth_header)" -H 'Content-Type: application/json' -d "$body" "$url"
-}
+api_get() { api_request GET "$1"; }
+api_post_json() { api_request POST "$1" "${2:-}"; }
 
 ################################################################################
 # Data fetchers
@@ -227,7 +258,7 @@ api_post_json() {
 fetch_projects() {
   # Returns JSON array of projects with id and number
   local url="https://cloudresourcemanager.googleapis.com/v3/projects:search"
-  local query="parent.type:organization parent.id:${ORG_ID} state:ACTIVE"
+  local query="parent=organizations/${ORG_ID} state:ACTIVE"
   local pageToken=""
   local all="[]"
 
@@ -239,7 +270,11 @@ fetch_projects() {
       req=$(jq -n --arg q "$query" '{query:$q,pageSize:1000}')
     fi
     local resp
-    resp=$(api_post_json "$url" "$req") || fail "Fetching projects failed"
+    resp=$(api_post_json "$url" "$req") || {
+      log "WARN: v3 projects:search failed; falling back to v1 projects.list"
+      fetch_projects_v1
+      return 0
+    }
 
     local items token
     items=$(printf '%s' "$resp" | jq -c '.projects // []')
@@ -251,6 +286,27 @@ fetch_projects() {
   done
 
   printf '%s' "$all" | jq -c '[.[] | {projectId:.projectId, projectNumber:(.projectNumber|tostring), displayName:.displayName}]'
+}
+
+fetch_projects_v1() {
+  # Fallback using v1 projects.list with filter
+  local base="https://cloudresourcemanager.googleapis.com/v1/projects"
+  local filter="parent.type:organization parent.id:${ORG_ID} lifecycleState:ACTIVE"
+  local pageToken=""
+  local all="[]"
+  while :; do
+    local full="${base}?pageSize=500&filter=$(printf '%s' "$filter" | jq -sRr @uri)"
+    [[ -n "$pageToken" ]] && full+="&pageToken=${pageToken}"
+    local resp
+    resp=$(api_get "$full") || fail "Fetching projects (v1) failed"
+    local items token
+    items=$(printf '%s' "$resp" | jq -c '.projects // []')
+    all=$(jq -c --argjson a "$all" --argjson b "$items" '$a + $b' <<<"null")
+    token=$(printf '%s' "$resp" | jq -r '.nextPageToken // empty')
+    [[ -z "$token" ]] && break
+    pageToken="$token"
+  done
+  printf '%s' "$all" | jq -c '[.[] | {projectId:.projectId, projectNumber:(.projectNumber|tostring), displayName:.name}]'
 }
 
 fetch_cai_outside_au() {
