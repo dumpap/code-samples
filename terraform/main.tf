@@ -26,6 +26,8 @@ locals {
   bucket_name = var.bucket_name != null ? var.bucket_name : "${var.project_id}-gcp-org-report"
 }
 
+data "google_project" "current" {}
+
 # Enable required services in the host project
 resource "google_project_service" "services" {
   for_each = toset([
@@ -101,7 +103,7 @@ resource "google_cloudfunctions2_function" "report_fn" {
 
   build_config {
     runtime     = "python311"
-    entry_point = "generate_report"
+    entry_point = "generate_report_pubsub"
 
     source {
       storage_source {
@@ -125,6 +127,13 @@ resource "google_cloudfunctions2_function" "report_fn" {
       RECOMMENDER_ENABLED    = var.enable_recommender ? "true" : "false"
       HTTP_TIMEOUT_SECONDS   = tostring(var.http_timeout_seconds)
     }
+  }
+
+  event_trigger {
+    trigger_region = var.region
+    event_type     = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic   = google_pubsub_topic.report_topic.id
+    retry_policy   = "RETRY_POLICY_RETRY"
   }
 }
 
@@ -155,28 +164,27 @@ resource "google_service_account" "scheduler_sa" {
   display_name = "GCP Org Report Scheduler SA"
 }
 
+resource "google_pubsub_topic" "report_topic" {
+  name = "gcp-org-report-topic"
+}
+
 resource "google_cloud_scheduler_job" "daily_job" {
   name        = "gcp-org-report-daily"
-  description = "Trigger org report function daily"
+  description = "Trigger org report function daily via Pub/Sub"
   schedule    = var.scheduler_cron
   time_zone   = var.scheduler_time_zone
 
-  http_target {
-    http_method = "GET"
-    uri         = google_cloudfunctions2_function.report_fn.service_config[0].uri
-
-    oidc_token {
-      service_account_email = google_service_account.scheduler_sa.email
-      audience              = google_cloudfunctions2_function.report_fn.service_config[0].uri
-    }
+  pubsub_target {
+    topic_name = google_pubsub_topic.report_topic.id
+    data       = base64encode("run")
   }
 }
 
-# IAM for scheduler SA to invoke the function
-resource "google_cloud_run_service_iam_member" "scheduler_invoker" {
-  location = google_cloudfunctions2_function.report_fn.location
-  project  = var.project_id
-  service  = google_cloudfunctions2_function.report_fn.name
-  role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.scheduler_sa.email}"
+# Allow Cloud Scheduler service agent to publish to the topic
+resource "google_pubsub_topic_iam_member" "scheduler_publisher" {
+  topic  = google_pubsub_topic.report_topic.name
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
 }
+
+# Pub/Sub push is not used; no invoker needed for HTTP. Scheduler publishes to Pub/Sub directly.

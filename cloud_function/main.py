@@ -247,29 +247,19 @@ def _render_html(org_id: str, projects: List[Dict[str, str]], assets: List[Dict[
     return html
 
 
-def generate_report(request):  # HTTP Cloud Function entrypoint
-    if request.method not in ("GET", "POST"):
-        return ("Method not allowed", 405)
-
+def _run_report() -> Dict[str, Any]:
     if not ORG_ID or not BUCKET_NAME:
-        return ("Missing ORG_ID or BUCKET_NAME env", 500)
+        raise RuntimeError("Missing ORG_ID or BUCKET_NAME env")
 
     session = _auth_session()
 
-    # Get projects via CAI
-    try:
-        projects = _projects_from_cai(session, ORG_ID)
-    except Exception as e:
-        return (f"CAI projects error: {e}", 500)
+    projects = _projects_from_cai(session, ORG_ID)
 
-    # Non-AU resources via CAI
     try:
         assets = _resources_outside_au(session, ORG_ID, ALLOWED_AU_LOCATIONS)
-    except Exception as e:
-        # Continue with empty assets but include error message in response
+    except Exception:
         assets = []
 
-    # Recommender
     recs: List[Dict[str, Any]] = []
     if RECOMMENDER_ENABLED:
         for p in projects:
@@ -277,23 +267,42 @@ def generate_report(request):  # HTTP Cloud Function entrypoint
             try:
                 recs.extend(_list_security_recommendations(session, pid))
             except Exception:
-                # Ignore per-project recommender errors
                 pass
 
     html = _render_html(ORG_ID, projects, assets, recs)
 
-    # Upload to GCS
     ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
     object_name = f"gcp_org_security_report_{ts}.html"
-    try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(object_name)
-        blob.cache_control = "no-cache"
-        blob.content_type = "text/html"
-        blob.upload_from_string(html, content_type="text/html")
-    except Exception as e:
-        return (f"GCS upload error: {e}", 500)
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(object_name)
+    blob.cache_control = "no-cache"
+    blob.content_type = "text/html"
+    blob.upload_from_string(html, content_type="text/html")
 
-    resp = {"status": "ok", "projects": len(projects), "resources_outside_au": len(assets), "security_recommendations": len(recs), "bucket": BUCKET_NAME, "object": object_name}
-    return (json.dumps(resp), 200, {"Content-Type": "application/json"})
+    return {
+        "projects": len(projects),
+        "resources_outside_au": len(assets),
+        "security_recommendations": len(recs),
+        "bucket": BUCKET_NAME,
+        "object": object_name,
+    }
+
+
+def generate_report_http(request):  # Optional HTTP entrypoint (not used in secure deployment)
+    try:
+        result = _run_report()
+        result.update({"status": "ok"})
+        return (json.dumps(result), 200, {"Content-Type": "application/json"})
+    except Exception as e:
+        return (str(e), 500)
+
+
+def generate_report_pubsub(event):  # Secure Pub/Sub entrypoint
+    try:
+        _run_report()
+    except Exception as e:
+        # Log to stdout/stderr for Cloud Logging
+        print(f"Report generation failed: {e}")
+        # Let the function fail to enable retry per trigger policy
+        raise
