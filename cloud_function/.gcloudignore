@@ -1,0 +1,7 @@
+# Ignore local files when deploying from this folder
+.git/
+.idea/
+__pycache__/
+*.pyc
+venv/
+.env
