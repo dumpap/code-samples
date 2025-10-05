@@ -58,6 +58,18 @@ command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 auth_header=( -H "Authorization: Bearer ${ACCESS_TOKEN}" )
 [[ -n "$QUOTA_PROJECT" ]] && cai_quota_header=( -H "x-goog-user-project: ${QUOTA_PROJECT}" ) || cai_quota_header=()
 
+ensure_json() {
+  # stdin -> validate JSON; on failure, print body and exit
+  local body
+  body=$(cat)
+  if ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+    echo "API returned non-JSON or HTML error page:" >&2
+    printf '%s\n' "$body" >&2
+    exit 1
+  fi
+  printf '%s' "$body"
+}
+
 # 1) Projects count via Resource Manager v1
 projects_count=0
 pageToken=""
@@ -77,7 +89,9 @@ while :; do
       --data-urlencode "pageSize=500" \
       --data-urlencode "filter=${crm_filter}")
   fi
-  projects_count=$(( projects_count + $(printf '%s' "$resp" | jq '.projects | length') ))
+  # Validate JSON before jq parsing
+  resp=$(printf '%s' "$resp" | ensure_json)
+  projects_count=$(( projects_count + $(printf '%s' "$resp" | jq '.projects | length // 0') ))
   pageToken=$(printf '%s' "$resp" | jq -r '.nextPageToken // empty')
   [[ -z "$pageToken" ]] && break
 done
@@ -112,6 +126,8 @@ while :; do
   fi
   resp=$(curl -sS -X POST "$cai_url" "${auth_header[@]}" "${cai_quota_header[@]}" \
     -H 'Content-Type: application/json' --max-time "$HTTP_TIMEOUT" -d "$body") || resp='{}'
+  # Validate JSON before jq parsing to avoid jq parse errors on HTML error pages
+  resp=$(printf '%s' "$resp" | ensure_json)
   # Append table rows: Project ID and Resource Name
   # project comes like "projects/PROJECT_ID"
   rows=$(printf '%s' "$resp" | jq -r '.results[]? | [ .project, .name ] | @tsv' | awk -F"\t" '{gsub(/^projects\//, "", $1); printf("<tr><td>%s</td><td><code>%s</code></td></tr>\n", $1, $2)}')
